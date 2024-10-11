@@ -1,262 +1,241 @@
 name: Deploy preview
-
 on:
   workflow_call:
     inputs:
       app_name:
-        description: The application name. Use the same name as the Github and ECR repository.
-        required: true
+        description: The name of the application
         type: string
-      service_type:
-        description: This is the service type to be used while generating manifests.
         required: true
-        type: string
-        default: webservice
-      port:
-        description: This is the application port number.
-        required: true
-        type: number
       aws_role:
-        description: The role used to grant access to AWS
+        description: AWS role to assume during deployment
+        type: string
         required: true
+      aws_eks_role:
+        description: AWS role that is used to deploy on EKS
         type: string
-
-      # Optional inputs goes here
-      app_name_postfix:
-        description: Postfix the app name if this workflow is being used for different things. I.e. two different docker builds.
-        required: false
+        required: true
+      aws_region:
+        description: The AWS region where cluster is located
         type: string
-      docker_build_args:
-        description: By using this you can add multi line build args to docker
-        required: false
+        required: true
+      cluster_name:
+        description: The name of the EKS cluster on which to deploy the preview
         type: string
+        required: true
       dockerfile:
-        description: The path to your dockerfile. Defaults to Dockerfile.
-        required: false
+        description: The path to the Dockerfile
         type: string
-        default: Dockerfile
-      path:
-        description: This is the index route to the application.
         required: false
+      docker_build_args:
+        description: Build arguments to pass to the Docker build
         type: string
-        default: /
-      fargate:
-        description: If the deployment should use fargate
         required: false
-        type: boolean
-        default: true
-      override_hostname:
-        description: Allows choosing another hostname for previews. Example- <override_hostname>_previews.dignio.dev
-        required: false
+      namespace:
+        description: The namespace in which to deploy the preview
         type: string
-
-    # Secrets
+        required: true
     secrets:
-      github_app_private_key:
-        description: The github app private key to be used for the preview link on PR generation
+      system_token:
+        description: GitHub token
         required: true
 
     outputs:
       preview_url:
-        description: The full preview URL
-        value: ${{ jobs.build_push_deploy.outputs.preview_url }}
+        value: ${{ jobs.setup.outputs.preview_url }}
+        description: The URL of the deployed preview
 
-
-# Permissions needed to run this workflow and the actions provided
-# https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#permissions
 permissions:
   id-token: write
   actions: write
   contents: read
 
-# Predefined environment variables used as default values
-env:
-  REGION: eu-north-1
-  NAMESPACE: previews
-  INSTANCE: previews
-  UTILITIES: .dignio-workflows/utilities
-  CLUSTER_NAME: dev-k8s
-
 jobs:
-  build_push_deploy:
-    name: Build and push image to ECR
-    if: github.event.action != 'closed'
-    # Prevents a workflow run from failing when a job fails
-    continue-on-error: true
+  setup:
     runs-on: ubuntu-latest
-
     outputs:
-      preview_url: "https://${{ steps.app_name.outputs.full_name }}.preview.dignio.dev"
-
+      preview_url: ${{ steps.print-preview-url.outputs.preview_url }}
+      pr_number: ${{ steps.sanitize_pr_name.outputs.PR_ID }}
+      pr_name: ${{ steps.sanitize_pr_name.outputs.PR_ID }}-${{ steps.repo_name.outputs.REPO_NAME }}
     steps:
-      # ===  Check out the current repository
-      - name: Checkout repository
-        uses: actions/checkout@v2
-
-      # ===  Check out dignio workflow repo for the utilities folder
-      - name: Checkout dignio/workflow repository
-        uses: actions/checkout@v3
-        with:
-          repository: dignio/workflows
-          path: ".dignio-workflows"
-
-      # === github.head_ref has to be used to get the branch name while in PR state
-      - name: Branch name to URL friendly string
-        uses: dignio/letter-case-action@v1
-        id: letter_case
-        with:
-          string: ${{ github.head_ref }}
-
-      # ===  Get the latest git short sha
-      - name: Get the git short id
-        id: short_id
+      - name: Sanitize pull request Name
+        id: sanitize_pr_name
+        shell: bash
         run: |
-          sha=$(cut -c 1-7 <<< ${{ github.event.pull_request.head.sha }})
-          echo "::set-output name=sha::$sha"
+          echo "PR_ID=pr-$(echo "$GITHUB_REF" | awk -F / '{print $3}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
-      # === Create the full app name for docker images and manifests
-      - name: Create full app name
-        id: app_name
-        run: bash ${{ env.UTILITIES }}/create-full-app-name.sh "${{ inputs.app_name }}" "${{ inputs.app_name_postfix }}" "${{ inputs.override_hostname }}" "${{ steps.letter_case.outputs.kebab }}"
+      - name: Repository name
+        id: repo_name
+        shell: bash
+        run: |
+          echo "REPO_NAME=$(echo $GITHUB_REPOSITORY | awk -F / '{print $2}')" >> $GITHUB_OUTPUT
 
+      - name: Print preview URL
+        id: print-preview-url
+        shell: bash
+        run: echo "preview_url=https://${{ steps.sanitize_pr_name.outputs.PR_ID }}-${{ steps.repo_name.outputs.REPO_NAME }}.preview-new.dignio.dev" >> $GITHUB_OUTPUT
+
+  build_and_push:
+    runs-on: ubuntu-latest
+    needs: setup
+    outputs:
+      image_tag: ${{ steps.metadata.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role }}
+          role-session-name: GithubActionsSession
+          aws-region: ${{ inputs.aws_region }}
+          mask-aws-account-id: false
+
+      - name: Login to AWS ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        with:
+          images: |
+            ${{ env.ECR_REGISTRY }}/${{ inputs.app_name }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=preview-${{ needs.setup.outputs.pr_number }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        if: github.event.action != 'closed'
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          provenance: false
+          build-args: ${{ inputs.docker_build_args }}
+          cache-from: type=registry,ref=${{ steps.metadata.outputs.tags }}
+          cache-to: type=inline
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+
+  deploy_on_eks:
+    runs-on: ubuntu-latest
+    needs: [setup, build_and_push]
+    steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
           role-to-assume: ${{ inputs.aws_role }}
           role-session-name: GithubActionsSession
-          aws-region: ${{ env.REGION }}
+          aws-region: ${{ inputs.aws_region }}
+          mask-aws-account-id: false
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-
-      - name: Build, tag, and push image to Amazon ECR
-        uses: docker/build-push-action@v2
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ inputs.app_name }}
+      - name: Checkout Kubernetes repo
+        uses: actions/checkout@v4
         with:
-          file: ${{ inputs.dockerfile }}
-          push: true
-          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.INSTANCE }}-${{ inputs.app_name_postfix }}-${{ steps.app_name.outputs.full_name }}-latest
-          cache-to: type=inline
-          build-args: ${{ inputs.docker_build_args }}
-          tags: |
-            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.INSTANCE }}-${{ inputs.app_name_postfix }}-${{ steps.app_name.outputs.full_name }}-latest
-            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.INSTANCE }}-${{ inputs.app_name_postfix }}-${{ steps.app_name.outputs.full_name }}-${{ steps.short_id.outputs.sha }}
+          repository: dignio/kubernetes
+          ref: DEVEX-356-fix-preview-functionality
+          sparse-checkout: |
+            argo/cluster/${{ inputs.cluster_name }}/preview/${{ inputs.app_name }}
+            argo/base/${{ inputs.app_name }}
+          token: ${{ secrets.system_token }}
 
-      - name: Deploy the service to Kubernetes
-        uses: dignio/deploy-service@v3
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
         with:
-          app_name: ${{ steps.app_name.outputs.full_name }}
-          service_type: ${{ inputs.service_type }}
-          cluster_name: ${{ env.CLUSTER_NAME }}
-          instance: ${{ env.INSTANCE }}
-          namespace: ${{ env.NAMESPACE }}
-          docker_image: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.app_name }}:${{ env.INSTANCE }}-${{ inputs.app_name_postfix }}-${{ steps.app_name.outputs.full_name }}-${{ steps.short_id.outputs.sha }}
-          aws_region: ${{ env.REGION }}
-          aws_role: ${{ inputs.aws_role }}
-          replicas: 1
-          port: ${{ inputs.port }}
-          container_port: ${{ inputs.port }}
-          fargate: ${{ inputs.fargate }}
+          version: "v1.29.7"
 
-      # === This will run a kubectl request to
-      # 1. fetch the index of the preview host to check the existence
-      # 2. if the host do not exist, patch the ingress with the new host
-      - name: Add the service to the preview ingress
-        run: bash ${{ env.UTILITIES }}/add-host-to-preview-ingress.sh ${{ env.NAMESPACE }} ${{ steps.app_name.outputs.full_name }} ${{ inputs.port }} ${{ inputs.path }}
+      - name: Generate kubeconfig for EKS and set as ENV
+        shell: bash
+        run: |
+          aws eks update-kubeconfig --name=${{ inputs.cluster_name }} --region=${{ inputs.aws_region }} --role-arn=${{ inputs.aws_eks_role }} --kubeconfig="/tmp/kubeconfig"
 
-      - name: Check if the preview URL is ready
-        run: bash ${{ env.UTILITIES }}/is-preview-host-ready.sh ${{ steps.app_name.outputs.full_name }} ${{ inputs.path }}
+          kubeconfig=$(cat /tmp/kubeconfig)
 
-      - name: Create a commit status with the Deploy Preview URL
+          echo "KUBECONFIG<<EOF" >> $GITHUB_ENV
+          echo "$kubeconfig" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Authenticate to the EKS cluster
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ env.KUBECONFIG }}
+
+      - name: Update IngressRoute
+        shell: bash
+        working-directory: argo/cluster/${{ inputs.cluster_name }}/preview/${{ inputs.app_name }}
+        run: |
+          yq e -i '.spec.routes[].match |= sub("pr-placeholder", "${{ needs.setup.outputs.pr_name }}")' routes.yaml
+
+      - name: Update Kustomize manifests
+        shell: bash
+        working-directory: argo/cluster/${{ inputs.cluster_name }}/preview/${{ inputs.app_name }}
+        run: |
+          kustomize edit set namesuffix -- -${{ needs.setup.outputs.pr_name }}
+          kustomize edit set image ${{ inputs.app_name }}=${{ needs.build_and_push.outputs.image_tag }}
+
+      # Update the annotation timestamp to trigger a rolling update and image pull
+      - name: Update annotation timestamp
+        if: github.event.action == 'synchronize'
+        shell: bash
+        working-directory: argo/cluster/${{ inputs.cluster_name }}/preview/${{ inputs.app_name }}
+        run: |
+          kustomize edit set annotation kubectl.kubernetes.io/restartedAt:"$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      - name: Create Kubernetes manifests
+        id: bake
+        uses: azure/k8s-bake@v3
+        with:
+          renderEngine: "kustomize"
+          kustomizationPath: "./argo/cluster/${{ inputs.cluster_name }}/preview/${{ inputs.app_name }}"
+
+      - name: Deploy preview to EKS
+        uses: Azure/k8s-deploy@v5
+        if: github.event.action != 'closed'
+        with:
+          manifests: ${{ steps.bake.outputs.manifestsBundle }}
+          namespace: ${{ inputs.namespace }}
+          annotate-namespace: false
+          annotate-resources: false
+
+      - name: Remove preview from EKS
+        if: github.event.action == 'closed'
+        shell: bash
+        run: |
+          kubectl delete -f ${{ steps.bake.outputs.manifestsBundle }} --namespace=${{ inputs.namespace }}
+
+  preview-status:
+    runs-on: ubuntu-latest
+    needs: [setup, deploy_on_eks]
+    steps:
+      - name: Preview Healthcheck
+        id: healthcheck
+        shell: bash
+        run: |
+          curl --retry 3 --retry-connrefused --retry-delay 5 --retry-max-time 30 -s -o /dev/null -w "%{http_code}" ${{ needs.setup.outputs.preview_url }}
+
+      - name: Create a PR status
+        continue-on-error: true
         uses: octokit/request-action@v2.x
         id: create_commit_status
         with:
-          name: "${{ steps.app_name.outputs.full_name }} deploy preview"
+          name: "${{ needs.setup.outputs.pr_number }} deploy preview"
           description: Deploy Preview ready! Click Details to browse to it.
-          context: "Preview - ${{ steps.app_name.outputs.full_name }}"
+          context: "Preview - ${{ needs.setup.outputs.pr_number }}"
           owner: dignio
           repo: ${{ github.event.repository.name }}
           state: success
           accept: application/vnd.github.v3+json
           route: POST /repos/{owner}/{repo}/statuses/{sha}
-          target_url: https://${{ steps.app_name.outputs.full_name }}.preview.dignio.dev
+          target_url: ${{ needs.setup.outputs.preview_url }}
           sha: ${{ github.event.pull_request.head.sha }}
         env:
-          GITHUB_TOKEN: ${{ steps.create-iat.outputs.token }}
-
-  # === This is the teardown the preview process
-  teardown:
-    name: Teardown the preview
-    if: github.event.action == 'closed'
-    # Prevents a workflow run from failing when a job fails
-    continue-on-error: true
-    runs-on: ubuntu-latest
-    steps:
-      # ===  Check out dignio workflow repo for the utilities folder
-      - name: Checkout dignio/workflow repository
-        uses: actions/checkout@v3
-        with:
-          repository: dignio/workflows
-          path: ".dignio-workflows"
-
-      # === github.head_ref has to be used to get the branch name while in PR state
-      - name: Branch name to URL friendly string
-        uses: dignio/letter-case-action@v1
-        id: letter_case
-        with:
-          string: ${{ github.head_ref }}
-
-      # === Create the full app name for docker images and manifests
-      - name: Create full app name
-        id: app_name
-        run: bash ${{ env.UTILITIES }}/create-full-app-name.sh "${{ inputs.app_name }}" "${{ inputs.app_name_postfix }}" "${{ inputs.override_hostname }}" "${{ steps.letter_case.outputs.kebab }}"
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          role-to-assume: ${{ inputs.aws_role }}
-          role-session-name: GithubActionsSession
-          aws-region: ${{ env.REGION }}
-
-      - name: Create the kubeconfig
-        id: kubeconfig
-        shell: bash
-        run: |
-          # fetch the aws account id
-          account_id="$(aws sts get-caller-identity --query Account --output text)"
-
-          # By running this command we are fetching the kube configuration for the github oidc user
-          # The OIDC user session is connected to the KubeGithubDeployment role for access to download the configuration
-          # Note, this is a short lived kubeconfig.
-          aws eks update-kubeconfig --name=${{ env.CLUSTER_NAME }} --region=${{ env.REGION }} --role-arn="arn:aws:iam::$account_id:role/KubeGithubDeployment" --kubeconfig=/tmp/kubeconfig
-
-          kubeconfig="$(cat /tmp/kubeconfig)"
-
-          # A hack to add the multiline configuration as an env variable
-          echo "DYNAMIC_KUBECONFIG<<EOF" >> $GITHUB_ENV
-          echo "$kubeconfig" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-
-      - name: Authenticate with Kubernetes
-        uses: azure/k8s-set-context@v1
-        with:
-          method: kubeconfig
-          kubeconfig: ${{ env.DYNAMIC_KUBECONFIG }}
-
-      - name: Add kubectl
-        uses: azure/setup-kubectl@v2.0
-        with:
-          version: "v1.22.0"
-
-      # === This will delete all resources connected to the preview deployment
-      - name: Delete the deployment and service
-        run: kubectl delete deployments,services,cm,pv,pvc,sc,secrets -l app=${{ steps.app_name.outputs.full_name }} --namespace=${{ env.NAMESPACE }}
-
-      # === This will run a kubectl request to
-      # 1. fetch the index of the preview host
-      # 2. patch the ingress with what host to remove based on the index
-      - name: Remove the host from the preview ingress
-        run: bash ${{ env.UTILITIES }}/remove-host-from-preview-ingress.sh ${{ env.NAMESPACE }} ${{ steps.app_name.outputs.full_name }}
+          GITHUB_TOKEN: ${{ secrets.system_token }}
